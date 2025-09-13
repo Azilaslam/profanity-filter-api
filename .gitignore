@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Local configs
+*.env
+
+# Local run helper
+run_api.bat
