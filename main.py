@@ -2,6 +2,8 @@ import os
 import re
 import random
 import pathlib
+import itertools
+import unicodedata
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from typing import Optional
@@ -64,6 +66,23 @@ if not BAD_EXTREME:
 if not BAD_MISC:
     BAD_MISC = {"puta","merda","merde","cabron","connard"}
 
+# Build normalized lookup sets for quick membership checks
+def normalize_lookup_word(w: str) -> str:
+    # strip diacritics and lowercase
+    nw = unicodedata.normalize("NFKD", w)
+    nw = "".join(ch for ch in nw if not unicodedata.combining(ch))
+    return nw.lower()
+
+# helper: collapse repeated letters to a single char for lookup matching
+def collapse_repeats_to_one(s: str) -> str:
+    return re.sub(r'(.)\1+', r'\1', s, flags=re.IGNORECASE)
+
+BAD_ALL_LOOKUP = {normalize_lookup_word(w) for w in BAD_ALL}
+BAD_EXTREME_LOOKUP = {normalize_lookup_word(w) for w in BAD_EXTREME}
+# also prepare collapsed forms set for fuzzy equality checks
+BAD_ALL_COLLAPSED = {collapse_repeats_to_one(normalize_lookup_word(w)) for w in BAD_ALL}
+BAD_EXTREME_COLLAPSED = {collapse_repeats_to_one(normalize_lookup_word(w)) for w in BAD_EXTREME}
+
 SYMBOLS = ["@", "#", "$", "!", "%", "&"]
 
 def censor_word(word: str, style: str) -> str:
@@ -106,7 +125,7 @@ LEET_MAP = {
     "r": ["r"],
     "s": ["s", "$", "5"],
     "t": ["t", "7", "+"],
-    "u": ["u", "v", "@"],   # include "@" so f@ck matches
+    "u": ["u", "v", "@"],
     "v": ["v", "\\/"],
     "w": ["w"],
     "x": ["x", "%"],
@@ -118,6 +137,8 @@ def char_class_for(ch: str) -> str:
     ch_low = ch.lower()
     if ch_low in LEET_MAP:
         parts = [re.escape(x) for x in set(LEET_MAP[ch_low])]
+        # sort longer first to avoid partial matches like "\" vs "\/"
+        parts = sorted(parts, key=lambda s: -len(s))
         return "(" + "|".join(parts) + ")"
     else:
         return re.escape(ch)
@@ -136,7 +157,7 @@ def build_fuzzy_pattern(word: str) -> str:
         parts = []
         for i, ch in enumerate(token):
             if ch.lower() in "aeiou":
-                # vowels: match 1-2 normal + allow extra repeats (we pre-normalize long stretches)
+                # vowels: match 1-2 normal + allow extra repeats (regex handles limited stretch)
                 parts.append(char_class_for(ch) + "{1,2}")
             else:
                 # consonants: normal, but if last char allow small repeat (1-5)
@@ -188,46 +209,183 @@ compile_patterns()
 # ---------------------------
 def remove_middle_fingers(text: str) -> str:
     out_chars = []
-    skip_next_ft = False
+    skip_skin_tone = False
     for ch in text:
         if ch == "\U0001F595":  # 🖕
-            skip_next_ft = True
+            skip_skin_tone = True
             continue
-        if skip_next_ft and "\U0001F3FB" <= ch <= "\U0001F3FF":
-            skip_next_ft = False
+        if skip_skin_tone and "\U0001F3FB" <= ch <= "\U0001F3FF":
+            # skip skin tone if it comes right after 🖕
+            skip_skin_tone = False
             continue
-        if skip_next_ft:
-            skip_next_ft = False
-        else:
-            out_chars.append(ch)
+        skip_skin_tone = False  # reset after one char
+        out_chars.append(ch)
     return "".join(out_chars)
 
+
 # ---------------------------
-# Normalizer: collapse suspicious letter stretches
+# Repeated-stretch helpers (pre-pass)
 # ---------------------------
-VOWEL_CLASS = "aeiou"
-# collapse 3+ vowels -> 2 vowels; collapse 3+ consonants -> 1 consonant
-def normalize_stretch(text: str) -> str:
-    # 1) collapse vowels repeated 3+ to exactly 2 (case-insensitive)
-    text = re.sub(r'([aeiouAEIOU])\1{2,}', lambda m: m.group(1) * 2, text)
-    # 2) collapse consonants repeated 3+ to single occurrence (avoid matching vowels)
-    text = re.sub(r'([^aeiouAEIOU\W_])\1{2,}', lambda m: m.group(1), text)
+MAX_REDUCTION_PER_BLOCK = 5
+MAX_VARIANTS_TOTAL = 50
+VOWELS = set("aeiouAEIOU")
+
+def find_consecutive_repeats(word: str):
+    """
+    Return list of (start_index, length) for runs where a character repeats > 2 times consecutively.
+    """
+    stretches = []
+    i = 0
+    while i < len(word):
+        j = i + 1
+        while j < len(word) and word[j].lower() == word[i].lower():
+            j += 1
+        length = j - i
+        if length > 2:
+            stretches.append((i, length))
+        i = j
+    return stretches
+
+def is_vowel(ch: str):
+    return ch.lower() in VOWELS
+
+def is_consonant(ch: str):
+    return ch.isalpha() and ch.lower() not in VOWELS
+
+def generate_reduction_variants(original: str, cap_per_block=MAX_REDUCTION_PER_BLOCK, max_total=MAX_VARIANTS_TOTAL):
+    """
+    Given an original token (string), find repeated blocks (vowels or consonants) and create variants
+    by reducing each block's length stepwise. Return a list of unique variants (strings).
+    Cap total variants to max_total.
+    """
+    stretches = find_consecutive_repeats(original)
+    if not stretches:
+        return []
+
+    # keep only stretches (vowels or consonants) but ignore non-alpha repeats
+    stretches = [(pos, length) for (pos, length) in stretches if original[pos].isalpha()]
+    if not stretches:
+        return []
+
+    # Build choices per block: for consonants reduce to (orig-1 ... orig-cap) keeping at least 1;
+    # for vowels reduce to 2 and 1 (we prefer reducing vowels to 2 or 1 to catch stretched vowels)
+    choices_per_block = []
+    for (pos, length) in stretches:
+        ch = original[pos]
+        if is_consonant(ch):
+            max_reduce = min(length - 1, cap_per_block)
+            keep_lengths = [length - r for r in range(1, max_reduce + 1)]
+            # ensure at least one option
+            if not keep_lengths:
+                keep_lengths = [length]
+            choices_per_block.append(keep_lengths)
+        elif is_vowel(ch):
+            # for vowels prefer reduce to 2 then to 1 (if possible)
+            opts = []
+            if length > 2:
+                # reduce down to 2
+                opts.append(2)
+                # also allow 1 if original length > 3 (optional)
+                if length > 3:
+                    opts.append(1)
+            else:
+                opts.append(length)
+            choices_per_block.append(opts)
+        else:
+            choices_per_block.append([length])
+
+    variants = []
+    seen = set()
+
+    # Cartesian product of choices (cap total variants)
+    for chosen in itertools.product(*choices_per_block):
+        w = list(original)
+        # apply from right to left so positions don't shift
+        for (pos, orig_len), keep_len in sorted(zip(stretches, chosen), key=lambda x: x[0][0], reverse=True):
+            ch = w[pos]
+            del w[pos:pos+orig_len]
+            w[pos:pos] = [ch] * keep_len
+        candidate = "".join(w)
+        if candidate not in seen:
+            variants.append(candidate)
+            seen.add(candidate)
+        if len(variants) >= max_total:
+            break
+
+    return variants
+
+def variant_matches_lookup(candidate: str, mode: str) -> bool:
+    """
+    Check candidate against lookup sets.
+    We compare:
+     - normalized candidate as-is
+     - collapsed candidate (repeated letters -> one) to catch stretched vowels
+    """
+    n = normalize_lookup_word(candidate)
+    collapsed = collapse_repeats_to_one(n)
+    if mode == "extreme":
+        if n in BAD_EXTREME_LOOKUP or collapsed in BAD_EXTREME_COLLAPSED:
+            return True
+        return False
+    else:
+        if n in BAD_ALL_LOOKUP or n in BAD_EXTREME_LOOKUP:
+            return True
+        if collapsed in BAD_ALL_COLLAPSED or collapsed in BAD_EXTREME_COLLAPSED:
+            return True
+        return False
+
+def pre_censor_repeated_stretches(text: str, mode: str, style: str) -> str:
+    """
+    Walk tokens, find tokens with letter runs >2 (vowel or consonant),
+    generate variants (reducing stretches) and if any variant matches badlist, mask original token.
+    """
+    token_re = re.compile(r"\b[\w@#\$%!\|\-']+\b", flags=re.UNICODE)
+
+    def replace_token(m):
+        token = m.group(0)
+        stretches = find_consecutive_repeats(token)
+        if not stretches:
+            return token
+        # only proceed if there's at least one alphabetic repeated block
+        if not any(token[pos].isalpha() for pos, _ in stretches):
+            return token
+        # generate variants
+        variants = generate_reduction_variants(token)
+        for v in variants:
+            if variant_matches_lookup(v, mode):
+                return censor_word(token, style)
+        return token
+
+    return token_re.sub(replace_token, text)
+
+# ---------------------------
+# Final sanitize: run PRECOMPILED regexes once more to be safe
+# ---------------------------
+def final_sanitize(text: str, style: str, mode: str) -> str:
+    patterns = PRECOMPILED.get(mode, [])
+    for regex in patterns:
+        text = regex.sub(lambda m: censor_word(m.group(0), style), text)
     return text
 
 # ---------------------------
-# Main censor logic
+# Main censor logic (new flow)
 # ---------------------------
 def smart_censor(text: str, style: str, mode: str) -> str:
-    # normalize suspicious stretches first to improve matching speed & avoid false positives
-    normalized = normalize_stretch(text)
+    # 1) operate on original but remove middle-finger emoji immediately
+    clean = remove_middle_fingers(text)
 
-    censored = normalized
+    # 2) pre-pass: mask tokens with suspicious letter stretches if variants match badlist
+    clean = pre_censor_repeated_stretches(clean, mode, style)
+
+    # 3) main fuzzy regex pass (leetspeak, separators, stretched vowels etc.)
     patterns = PRECOMPILED.get(mode, [])
     for regex in patterns:
-        censored = regex.sub(lambda m: censor_word(m.group(), style), censored)
+        clean = regex.sub(lambda m: censor_word(m.group(0), style), clean)
 
-    censored = remove_middle_fingers(censored)
-    return censored
+    # 4) final sanitize pass (failsafe)
+    clean = final_sanitize(clean, style, mode)
+
+    return clean
 
 @app.post("/v1/censor")
 def censor(req: CensorIn):
