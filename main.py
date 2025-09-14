@@ -1,3 +1,4 @@
+# main.py
 import os
 import re
 import random
@@ -227,24 +228,8 @@ def remove_middle_fingers(text: str) -> str:
 # Repeated-stretch helpers (pre-pass)
 # ---------------------------
 MAX_REDUCTION_PER_BLOCK = 5
-MAX_VARIANTS_TOTAL = 50
+MAX_VARIANTS_TOTAL = 200
 VOWELS = set("aeiouAEIOU")
-
-def find_consecutive_repeats(word: str):
-    """
-    Return list of (start_index, length) for runs where a character repeats > 2 times consecutively.
-    """
-    stretches = []
-    i = 0
-    while i < len(word):
-        j = i + 1
-        while j < len(word) and word[j].lower() == word[i].lower():
-            j += 1
-        length = j - i
-        if length > 2:
-            stretches.append((i, length))
-        i = j
-    return stretches
 
 def is_vowel(ch: str):
     return ch.lower() in VOWELS
@@ -252,57 +237,65 @@ def is_vowel(ch: str):
 def is_consonant(ch: str):
     return ch.isalpha() and ch.lower() not in VOWELS
 
+def find_alpha_runs(word: str):
+    """
+    Return list of (start_index, length, char) for consecutive same-char runs (letters only).
+    We only return alphabetic runs (letters), skipping digits/punct.
+    """
+    runs = []
+    i = 0
+    while i < len(word):
+        if not word[i].isalpha():
+            i += 1
+            continue
+        j = i + 1
+        while j < len(word) and word[j].lower() == word[i].lower():
+            j += 1
+        runs.append((i, j - i, word[i]))
+        i = j
+    return runs
+
 def generate_reduction_variants(original: str, cap_per_block=MAX_REDUCTION_PER_BLOCK, max_total=MAX_VARIANTS_TOTAL):
     """
-    Given an original token (string), find repeated blocks (vowels or consonants) and create variants
-    by reducing each block's length stepwise. Return a list of unique variants (strings).
-    Cap total variants to max_total.
+    Given an original token (string), find repeated alpha runs and create variants
+    by reducing each run's length stepwise. Return a list of unique variants (strings).
+    This version accepts runs of length >=2 (not just >2) but we cap choices to avoid explosion.
     """
-    stretches = find_consecutive_repeats(original)
-    if not stretches:
+    runs = find_alpha_runs(original)
+    # keep only runs with length >=2 (alpha)
+    target_runs = [(pos, length, ch) for (pos, length, ch) in runs if length >= 2]
+    if not target_runs:
         return []
 
-    # keep only stretches (vowels or consonants) but ignore non-alpha repeats
-    stretches = [(pos, length) for (pos, length) in stretches if original[pos].isalpha()]
-    if not stretches:
-        return []
-
-    # Build choices per block: for consonants reduce to (orig-1 ... orig-cap) keeping at least 1;
-    # for vowels reduce to 2 and 1 (we prefer reducing vowels to 2 or 1 to catch stretched vowels)
-    choices_per_block = []
-    for (pos, length) in stretches:
-        ch = original[pos]
-        if is_consonant(ch):
-            max_reduce = min(length - 1, cap_per_block)
-            keep_lengths = [length - r for r in range(1, max_reduce + 1)]
-            # ensure at least one option
-            if not keep_lengths:
-                keep_lengths = [length]
-            choices_per_block.append(keep_lengths)
-        elif is_vowel(ch):
-            # for vowels prefer reduce to 2 then to 1 (if possible)
+    # Build choices per target run
+    choices_per_run = []
+    for pos, length, ch in target_runs:
+        if is_vowel(ch):
+            # reduce vowels to 2 and optionally 1
             opts = []
             if length > 2:
-                # reduce down to 2
                 opts.append(2)
-                # also allow 1 if original length > 3 (optional)
                 if length > 3:
                     opts.append(1)
             else:
-                opts.append(length)
-            choices_per_block.append(opts)
+                # if length == 2, we still allow leaving as 2 and also 1 — useful for adj-run cases
+                opts = [2, 1]
+            choices_per_run.append(sorted(set(opts)))
+        elif is_consonant(ch):
+            # for consonants allow keeping original length and reducing down to 1 (bounded)
+            opts = list(range(max(1, length - cap_per_block), length + 1))
+            # ensure descending preference: keep larger lengths first for realistic variants
+            choices_per_run.append(sorted(set(opts), reverse=True))
         else:
-            choices_per_block.append([length])
+            choices_per_run.append([length])
 
     variants = []
     seen = set()
-
-    # Cartesian product of choices (cap total variants)
-    for chosen in itertools.product(*choices_per_block):
+    # Cartesian product but cap total
+    for chosen in itertools.product(*choices_per_run):
         w = list(original)
         # apply from right to left so positions don't shift
-        for (pos, orig_len), keep_len in sorted(zip(stretches, chosen), key=lambda x: x[0][0], reverse=True):
-            ch = w[pos]
+        for (pos, orig_len, ch), keep_len in sorted(zip(target_runs, chosen), key=lambda x: x[0][0], reverse=True):
             del w[pos:pos+orig_len]
             w[pos:pos] = [ch] * keep_len
         candidate = "".join(w)
@@ -311,7 +304,6 @@ def generate_reduction_variants(original: str, cap_per_block=MAX_REDUCTION_PER_B
             seen.add(candidate)
         if len(variants) >= max_total:
             break
-
     return variants
 
 def variant_matches_lookup(candidate: str, mode: str) -> bool:
@@ -336,20 +328,50 @@ def variant_matches_lookup(candidate: str, mode: str) -> bool:
 
 def pre_censor_repeated_stretches(text: str, mode: str, style: str) -> str:
     """
-    Walk tokens, find tokens with letter runs >2 (vowel or consonant),
-    generate variants (reducing stretches) and if any variant matches badlist, mask original token.
+    Walk tokens, find tokens with letter runs >=2, detect suspicious tokens:
+      - any run length > 2 (a clear stretch), OR
+      - any internal consonant run length >= 2 (e.g., 'bb' in 'dumbbass', 'hh' in 'asshhole'), OR
+      - two or more adjacent consonant runs (length >=2) next to each other
+    For suspicious tokens, generate reduction variants and test them against bad lists.
+    If any variant matches, censor original token.
     """
     token_re = re.compile(r"\b[\w@#\$%!\|\-']+\b", flags=re.UNICODE)
 
     def replace_token(m):
         token = m.group(0)
-        stretches = find_consecutive_repeats(token)
-        if not stretches:
+        runs = find_alpha_runs(token)
+        target_runs = [(pos, length, ch) for (pos, length, ch) in runs if length >= 2 and ch.isalpha()]
+        if not target_runs:
             return token
-        # only proceed if there's at least one alphabetic repeated block
-        if not any(token[pos].isalpha() for pos, _ in stretches):
+
+        suspicious = False
+
+        # Rule A: any run length > 2
+        if any(length > 2 for (_, length, _) in target_runs):
+            suspicious = True
+
+        # Rule B: internal consonant run length >= 2
+        if not suspicious:
+            for pos, length, ch in target_runs:
+                if is_consonant(ch):
+                    # internal = not starting at 0 and not ending at last char
+                    if pos != 0 and (pos + length) < len(token):
+                        suspicious = True
+                        break
+
+        # Rule C: two adjacent consonant runs (length >=2 each)
+        if not suspicious:
+            for i in range(len(target_runs) - 1):
+                pos1, len1, ch1 = target_runs[i]
+                pos2, len2, ch2 = target_runs[i+1]
+                if pos1 + len1 == pos2 and is_consonant(ch1) and is_consonant(ch2):
+                    suspicious = True
+                    break
+
+        if not suspicious:
             return token
-        # generate variants
+
+        # Generate reduction variants and check
         variants = generate_reduction_variants(token)
         for v in variants:
             if variant_matches_lookup(v, mode):
@@ -357,6 +379,7 @@ def pre_censor_repeated_stretches(text: str, mode: str, style: str) -> str:
         return token
 
     return token_re.sub(replace_token, text)
+
 
 # ---------------------------
 # Final sanitize: run PRECOMPILED regexes once more to be safe
