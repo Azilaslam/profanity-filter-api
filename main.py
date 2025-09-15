@@ -328,57 +328,88 @@ def variant_matches_lookup(candidate: str, mode: str) -> bool:
 
 def pre_censor_repeated_stretches(text: str, mode: str, style: str) -> str:
     """
-    Walk tokens, find tokens with letter runs >=2, detect suspicious tokens:
-      - any run length > 2 (a clear stretch), OR
-      - any internal consonant run length >= 2 (e.g., 'bb' in 'dumbbass', 'hh' in 'asshhole'), OR
-      - two or more adjacent consonant runs (length >=2) next to each other
-    For suspicious tokens, generate reduction variants and test them against bad lists.
-    If any variant matches, censor original token.
+    Simple rule implementation:
+      - find tokens containing repeated letters (runs length >= 2)
+      - for those tokens, generate variants by reducing each repeated run (trying lengths 1..orig_len capped)
+      - if any variant matches the bad-word lookup, censor the ORIGINAL token
+      - otherwise keep the original token unchanged
+    Safety caps:
+      - cap per-run reduction to MAX_REDUCTION_PER_BLOCK (e.g., if run length 10 and cap 5, try keep lengths 1..10 but reduce choices are capped)
+      - cap total variants to MAX_VARIANTS_TOTAL
     """
     token_re = re.compile(r"\b[\w@#\$%!\|\-']+\b", flags=re.UNICODE)
 
     def replace_token(m):
         token = m.group(0)
-        runs = find_alpha_runs(token)
+
+        # quick guard: don't try tiny tokens
+        if len(token) < 3:
+            return token
+
+        # find alphabetic runs (letters only)
+        runs = find_alpha_runs(token)  # from your helper above
+        # filter only runs length >= 2
         target_runs = [(pos, length, ch) for (pos, length, ch) in runs if length >= 2 and ch.isalpha()]
         if not target_runs:
             return token
 
-        suspicious = False
+        # Build choices per run: for each repeated block, choose a keep-length list.
+        choices = []
+        for pos, length, ch in target_runs:
+            # prefer to try realistic reductions:
+            # allow keep-length from 1 .. min(length, length) but cap amount of choices
+            # we choose few representative options: keep original, keep smaller down to 1 (capped)
+            max_keep = length
+            min_keep = 1
+            # create a bounded list of keep lengths (descending preference)
+            # e.g., for length=6 and cap=5 -> opts = [6,5,4,3,2,1] but we'll trim to reasonable size if needed
+            opts = list(range(max_keep, min_keep - 1, -1))
+            # trim options if too many (limit per block to MAX_REDUCTION_PER_BLOCK choices)
+            if len(opts) > MAX_REDUCTION_PER_BLOCK:
+                opts = opts[:MAX_REDUCTION_PER_BLOCK]
+            choices.append(opts)
 
-        # Rule A: any run length > 2
-        if any(length > 2 for (_, length, _) in target_runs):
-            suspicious = True
-
-        # Rule B: internal consonant run length >= 2
-        if not suspicious:
+        # If product is huge, bail early
+        total_possible = 1
+        for c in choices:
+            total_possible *= len(c)
+            if total_possible > MAX_VARIANTS_TOTAL:
+                break
+        if total_possible > MAX_VARIANTS_TOTAL:
+            # fallback: be conservative — only try the most-likely reductions: reduce each run to either original or 1
+            choices = []
             for pos, length, ch in target_runs:
-                if is_consonant(ch):
-                    # internal = not starting at 0 and not ending at last char
-                    if pos != 0 and (pos + length) < len(token):
-                        suspicious = True
-                        break
+                opts = [length]
+                if length > 1:
+                    opts.append(1)
+                choices.append(opts)
 
-        # Rule C: two adjacent consonant runs (length >=2 each)
-        if not suspicious:
-            for i in range(len(target_runs) - 1):
-                pos1, len1, ch1 = target_runs[i]
-                pos2, len2, ch2 = target_runs[i+1]
-                if pos1 + len1 == pos2 and is_consonant(ch1) and is_consonant(ch2):
-                    suspicious = True
-                    break
-
-        if not suspicious:
-            return token
-
-        # Generate reduction variants and check
-        variants = generate_reduction_variants(token)
-        for v in variants:
-            if variant_matches_lookup(v, mode):
+        # generate variants (Cartesian product), cap results
+        variants_tried = 0
+        seen = set()
+        for chosen in itertools.product(*choices):
+            # construct candidate by applying chosen keep lengths (apply right-to-left so indexes stay valid)
+            w = list(token)
+            for (pos, orig_len, ch), keep_len in sorted(zip(target_runs, chosen), key=lambda x: x[0][0], reverse=True):
+                # remove the original run and insert keep_len copies
+                del w[pos:pos+orig_len]
+                w[pos:pos] = [ch] * keep_len
+            candidate = "".join(w)
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            variants_tried += 1
+            # check lookup
+            if variant_matches_lookup(candidate, mode):  # your helper above
                 return censor_word(token, style)
+            if variants_tried >= MAX_VARIANTS_TOTAL:
+                break
+
+        # no matching variant found -> return original unchanged
         return token
 
     return token_re.sub(replace_token, text)
+
 
 
 # ---------------------------
